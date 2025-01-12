@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SockJS + STOMP Test Page</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .form-group {
+            margin-bottom: 15px;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+        }
+        input[type="text"], textarea {
+            width: 100%;
+            padding: 8px;
+            box-sizing: border-box;
+        }
+        button {
+            padding: 10px 15px;
+            background-color: #007bff;
+            color: white;
+            border: none;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        .messages {
+            margin-top: 20px;
+            border: 1px solid #ccc;
+            padding: 10px;
+            height: 200px;
+            overflow-y: auto;
+        }
+        .subscriptions {
+            margin-top: 20px;
+        }
+        .subscription-item {
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 10px; /* 增加间距 */
+        }
+        .status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-left: 10px;
+            background-color: red; /* 默认断开状态 */
+        }
+        .status-indicator.connected {
+            background-color: green; /* 连接状态 */
+        }
+        .url-container {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .url-container input {
+            flex: 1;
+            margin-right: 10px;
+        }
+        .messages-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        .header-group {
+            margin-top: 10px;
+        }
+        .header-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            margin-bottom: 5px;
+        }
+        .header-item input {
+            flex: 1;
+        }
+        .header-item button {
+            background-color: #dc3545;
+        }
+        .header-item button:hover {
+            background-color: #c82333;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>SockJS + STOMP Test Page</h1>
+
+        <div class="form-group">
+            <label for="connectUrl">WebSocket URL:</label>
+            <div class="url-container">
+                <input type="text" id="connectUrl" value="http://localhost:8080/ws">
+                <span id="statusIndicator" class="status-indicator"></span>
+            </div>
+        </div>
+
+        <div class="form-group">
+            <label>CONNECT Frame Headers:</label>
+            <div id="connectHeaderList">
+                <div class="header-item">
+                    <input type="text" class="headerKey" placeholder="Header Key">
+                    <input type="text" class="headerValue" placeholder="Header Value">
+                    <button onclick="removeConnectHeader(this)">Remove</button>
+                </div>
+            </div>
+            <button onclick="addConnectHeader()">Add Header</button>
+        </div>
+
+        <div class="form-group">
+            <button id="connectBtn">Connect</button>
+            <button id="disconnectBtn" disabled>Disconnect</button>
+        </div>
+
+        <div class="form-group">
+            <label for="subscribeDestination">Subscribe Destination:</label>
+            <input type="text" id="subscribeDestination" value="/topic/greetings">
+            <button id="subscribeBtn" disabled>Subscribe</button>
+        </div>
+
+        <div class="subscriptions" id="subscriptions">
+            <h3>Active Subscriptions</h3>
+            <div id="subscriptionList"></div>
+        </div>
+
+        <div class="form-group">
+            <label for="sendDestination">Send Destination:</label>
+            <input type="text" id="sendDestination" value="/app/hello">
+        </div>
+
+        <div class="form-group">
+            <label for="messageContent">Message Content:</label>
+            <textarea id="messageContent" rows="3">{"name": "Test User"}</textarea>
+            <button id="sendBtn" disabled>Send Message</button>
+        </div>
+
+        <div class="form-group">
+            <div class="messages-header">
+                <label>Received Messages:</label>
+                <button id="clearMessagesBtn">Clear Messages</button>
+            </div>
+            <div class="messages" id="messages"></div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/sockjs-client/dist/sockjs.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/stompjs/lib/stomp.min.js"></script>
+    <script>
+        let stompClient = null;
+        const subscriptions = new Map(); // 存储订阅ID和对应的destination
+        let heartbeatInterval = null; // 心跳检测定时器
+
+        const connectUrl = document.getElementById('connectUrl');
+        const connectBtn = document.getElementById('connectBtn');
+        const disconnectBtn = document.getElementById('disconnectBtn');
+        const subscribeDestination = document.getElementById('subscribeDestination');
+        const subscribeBtn = document.getElementById('subscribeBtn');
+        const sendDestination = document.getElementById('sendDestination');
+        const messageContent = document.getElementById('messageContent');
+        const sendBtn = document.getElementById('sendBtn');
+        const messages = document.getElementById('messages');
+        const subscriptionList = document.getElementById('subscriptionList');
+        const statusIndicator = document.getElementById('statusIndicator');
+        const clearMessagesBtn = document.getElementById('clearMessagesBtn');
+        const connectHeaderList = document.getElementById('connectHeaderList');
+
+        // 更新连接状态
+        function updateStatus(connected) {
+            statusIndicator.classList.toggle('connected', connected);
+        }
+
+        // 心跳检测
+        function startHeartbeat() {
+            heartbeatInterval = setInterval(() => {
+                if (stompClient && stompClient.connected) {
+                    stompClient.send('/heartbeat', {}, 'ping'); // 发送心跳消息
+                } else {
+                    clearInterval(heartbeatInterval);
+                    updateStatus(false); // 连接断开
+                }
+            }, 5000); // 每5秒发送一次心跳
+        }
+
+        // 获取 CONNECT 帧的自定义 Header
+        function getConnectHeaders() {
+            const headers = {};
+            const headerItems = connectHeaderList.querySelectorAll('.header-item');
+            headerItems.forEach(item => {
+                const key = item.querySelector('.headerKey').value;
+                const value = item.querySelector('.headerValue').value;
+                if (key && value) {
+                    headers[key] = value;
+                }
+            });
+            return headers;
+        }
+
+        function connect() {
+            const socket = new SockJS(connectUrl.value);
+            stompClient = Stomp.over(socket);
+
+            const headers = getConnectHeaders(); // 获取 CONNECT 帧的自定义 Header
+
+            stompClient.connect(headers, function (frame) {
+                console.log('Connected: ' + frame);
+                updateStatus(true); // 更新状态为连接
+                connectBtn.disabled = true;
+                disconnectBtn.disabled = false;
+                subscribeBtn.disabled = false;
+                sendBtn.disabled = false;
+                startHeartbeat(); // 开始心跳检测
+            }, function (error) {
+                console.error('Connection error:', error);
+                updateStatus(false); // 更新状态为断开
+                clearInterval(heartbeatInterval); // 停止心跳检测
+            });
+        }
+
+        function disconnect() {
+            if (stompClient !== null) {
+                stompClient.disconnect();
+                console.log('Disconnected');
+                updateStatus(false); // 更新状态为断开
+                connectBtn.disabled = false;
+                disconnectBtn.disabled = true;
+                subscribeBtn.disabled = true;
+                sendBtn.disabled = true;
+                subscriptions.clear(); // 清空订阅列表
+                updateSubscriptionList();
+                clearInterval(heartbeatInterval); // 停止心跳检测
+            }
+        }
+
+        function subscribe() {
+            const destination = subscribeDestination.value;
+            if (stompClient && destination && !subscriptions.has(destination)) {
+                const subscription = stompClient.subscribe(destination, function (message) {
+                    const messageElement = document.createElement('div');
+                    messageElement.textContent = `[${destination}] ${message.body}`;
+                    messages.appendChild(messageElement);
+                    messages.scrollTop = messages.scrollHeight;
+                });
+
+                subscriptions.set(destination, subscription); // 存储订阅
+                updateSubscriptionList();
+                console.log('Subscribed to ' + destination);
+            }
+        }
+
+        function unsubscribe(destination) {
+            if (stompClient && subscriptions.has(destination)) {
+                const subscription = subscriptions.get(destination);
+                subscription.unsubscribe(); // 取消订阅
+                subscriptions.delete(destination); // 从Map中移除
+                updateSubscriptionList();
+                console.log('Unsubscribed from ' + destination);
+            }
+        }
+
+        function updateSubscriptionList() {
+            subscriptionList.innerHTML = ''; // 清空当前列表
+            subscriptions.forEach((subscription, destination) => {
+                const subscriptionItem = document.createElement('div');
+                subscriptionItem.className = 'subscription-item';
+                subscriptionItem.textContent = destination;
+                const unsubscribeBtn = document.createElement('button');
+                unsubscribeBtn.textContent = 'Unsubscribe';
+                unsubscribeBtn.onclick = () => unsubscribe(destination);
+                subscriptionItem.appendChild(unsubscribeBtn);
+                subscriptionList.appendChild(subscriptionItem);
+            });
+        }
+
+        function sendMessage() {
+            if (stompClient && sendDestination.value && messageContent.value) {
+                stompClient.send(sendDestination.value, {}, messageContent.value);
+                console.log('Message sent to ' + sendDestination.value);
+            }
+        }
+
+        // 清空消息
+        function clearMessages() {
+            messages.innerHTML = '';
+        }
+
+        // 添加 CONNECT 帧的 Header 输入框
+        function addConnectHeader() {
+            const headerItem = document.createElement('div');
+            headerItem.className = 'header-item';
+            headerItem.innerHTML = `
+                <input type="text" class="headerKey" placeholder="Header Key">
+                <input type="text" class="headerValue" placeholder="Header Value">
+                <button onclick="removeConnectHeader(this)">Remove</button>
+            `;
+            connectHeaderList.appendChild(headerItem);
+        }
+
+        // 移除 CONNECT 帧的 Header 输入框
+        function removeConnectHeader(button) {
+            button.parentElement.remove();
+        }
+
+        connectBtn.addEventListener('click', connect);
+        disconnectBtn.addEventListener('click', disconnect);
+        subscribeBtn.addEventListener('click', subscribe);
+        sendBtn.addEventListener('click', sendMessage);
+        clearMessagesBtn.addEventListener('click', clearMessages);
+    </script>
+</body>
+</html>
